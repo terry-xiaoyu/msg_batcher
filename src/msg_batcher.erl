@@ -1,6 +1,7 @@
 -module(msg_batcher).
 
 -export([ start_link/5
+        , stop/1
         , start_supervised_simple/3
         , start_supervised/5
         , stop_supervised/1
@@ -83,6 +84,9 @@
                  BatcherOpts :: batcher_opts()) -> {ok, pid()} | ignore | {error, term()}.
 start_link(ServerName, Module, Args, Options, BatcherOpts) ->
     msg_batcher_proc:start_link(ServerName, Module, Args, Options, BatcherOpts).
+
+stop(ServerName) ->
+    msg_batcher_proc:stop(ServerName).
 
 -spec start_supervised_simple(server_name(), simple_callback(), batcher_opts()) ->
     supervisor:startchild_ret().

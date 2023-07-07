@@ -8,7 +8,7 @@
 -behaviour(gen_server).
 
 %% API
--export([start_link/5]).
+-export([start_link/5, stop/1]).
 %% gen_server callbacks
 -export([init/1,
          handle_call/3,
@@ -36,6 +36,9 @@
 
 start_link(Id, BhvMod, InitArgs, GenOpts, Opts) ->
     gen_server:start_link({local, Id}, ?MODULE, {Id, BhvMod, InitArgs, Opts}, GenOpts).
+
+stop(Id) ->
+    gen_server:stop(Id).
 
 enqueue(Id, Msg) ->
     #{batcher_id := Id, batch_size := BatchSize, counter_ref := CRef,
@@ -119,10 +122,10 @@ handle_info(Info, #{behaviour_module := Mod, batch_callback_state := CallbackSta
     ?IF_EXPORTED(Mod, handle_info, 2,
         handle_return(Mod:handle_info(Info, CallbackState), Data), {noreply, Data}).
 
-terminate(Reason, #{batcher_id := Id, behaviour_module := Mod, batch_callback_state := CallbackState} = Data) ->
+terminate(Reason, #{batcher_id := Id, behaviour_module := Mod, batch_callback_state := CallbackState}) ->
     msg_batcher_object:delete(Id),
     ?IF_EXPORTED(Mod, terminate, 2,
-        handle_return(Mod:terminate(Reason, CallbackState), Data), ok).
+        Mod:terminate(Reason, CallbackState), ok).
 
 code_change(OldVsn, #{behaviour_module := Mod, batch_callback_state := CallbackState} = Data, Extra) ->
     ?IF_EXPORTED(Mod, code_change, 3,

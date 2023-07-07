@@ -43,7 +43,7 @@ ok = msg_batcher:enqueue(_Name = abcd, _Msg = <<"hello">>).
 -behaviour(msg_batcher).
 
 %% API
--export([start_link/1, send_msg/1]).
+-export([start_link/0, send_msg/1]).
 
 %% Callbacks are just the same as gen_server callbacks, other than the handle_batch/2.
 -export([init/1,
@@ -54,18 +54,18 @@ ok = msg_batcher:enqueue(_Name = abcd, _Msg = <<"hello">>).
          terminate/2,
          code_change/3]).
 
-start_link(Args) ->
+start_link() ->
     BatcherOpts = #{
         batch_size => 100,
         batch_time => 500,
         drop_factor => 10
     },
-    msg_batcher:start_link(_Name = ?MODULE, ?MODULE, Args, [], BatcherOpts).
+    msg_batcher:start_link(_Name = ?MODULE, ?MODULE, {}, [], BatcherOpts).
 
 send_msg(Msg) ->
     msg_batcher:enqueue(_Name = ?MODULE, Msg).
 
-init(Args) ->
+init({}) ->
     {ok, _State = #{foo => bar}}.
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
@@ -87,7 +87,7 @@ terminate(_Reason, _State) ->
 
 ```erlang
 
-{ok, _Pid} = my_process:start_link(_Args = #{batch_size => 10000, batch_time => 30000}).
+{ok, _Pid} = my_process:start_link().
 
 my_process:send_msg(<<"hello">>).
 
