@@ -9,6 +9,7 @@
         , handle_call/3
         , handle_cast/2
         , handle_info/2
+        , handle_continue/2
         , handle_batch/2
         , terminate/2
         ]).
@@ -51,7 +52,9 @@ behaviour_batcher_test() ->
         batch_time => 500,
         drop_factor => 100
     },
-    {ok, Pid} = msg_batcher:start_link(?MODULE, ?MODULE, {self()}, [], BatcherOpts),
+    {ok, Pid} = msg_batcher:start_link(?MODULE, ?MODULE, {self(), cont}, [], BatcherOpts),
+    receive {continued, cont} -> ok after 1000 -> throw(continue_not_called) end,
+
     ?assertMatch(#{batch_size := 100, batch_time := 500,
                    drop_factor := 100, sender_punish_time := donot_punish},
         msg_batcher_object:get(?MODULE)),
@@ -84,8 +87,12 @@ behaviour_batcher_test() ->
 
 %%==============================================================================
 %% callbacks of msg_batcher
-init({Parent}) ->
-    {ok, #{cnt => 0, parent => Parent, got_call => [], got_cast => [], got_info => []}}.
+init({Parent, ContineInfo}) ->
+    {ok, #{cnt => 0, parent => Parent, got_call => [], got_cast => [], got_info => []},
+        {continue, ContineInfo}}.
+handle_continue(Info, #{parent := Parent} = State) ->
+    Parent ! {continued, Info},
+    {noreply, State}.
 handle_call(Request, _From, #{got_call := Calls} = State) ->
     {reply, ok, State#{got_call => [Request | Calls]}}.
 handle_cast(Msg, #{got_cast := Casts} = State) ->
