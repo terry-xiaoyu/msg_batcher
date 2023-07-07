@@ -9,6 +9,11 @@
 
 -export([start_link/0]).
 
+-export([ start_supervised_simple/3
+        , start_supervised/5
+        , stop_supervised/1
+        ]).
+
 -export([init/1]).
 
 -define(SERVER, ?MODULE).
@@ -16,15 +21,40 @@
 start_link() ->
     supervisor:start_link({local, ?SERVER}, ?MODULE, []).
 
-start_supervised() ->
+start_supervised_simple(Id, {_Mod, _Func, _Args} = Callback, BatcherOpts) ->
+    start_supervised(Id, undefined, [], [],
+        BatcherOpts#{
+            batch_callback => Callback
+        });
+start_supervised_simple(Id, {Mod, Func, Args, InitState}, BatcherOpts) ->
+    start_supervised(Id, undefined, [], [],
+        BatcherOpts#{
+            batch_callback => {Mod, Func, Args},
+            batch_callback_state => InitState
+        }).
+
+start_supervised(Id, Module, InitArgs, Options, BatcherOpts) ->
+    BatcherMod = msg_batcher_proc,
+    MFA = {BatcherMod, start_link, [Id, Module, InitArgs, Options, BatcherOpts]},
     supervisor:start_child(?SERVER, #{
-        id => {ets_batcher, Id},
-        start => {emqx_rule_actions_ets_batcher, start_link, [Id, BatchSize, BatchTime, Callback, Opts]},
+        id => Id,
+        start => MFA,
         restart => permanent,
         shutdown => 5000,
         type => worker,
-        modules => [emqx_rule_actions_ets_batcher]
+        modules => [BatcherMod]
     }).
+
+stop_supervised(Id) ->
+    case supervisor:terminate_child(?SERVER, Id) of
+        ok ->
+            case supervisor:delete_child(?SERVER, Id) of
+                ok -> ok;
+                {error, not_found} -> ok
+            end;
+        {error, not_found} -> ok;
+        {error, _} = Err -> Err
+    end.
 
 %% sup_flags() = #{strategy => strategy(),         % optional
 %%                 intensity => non_neg_integer(), % optional

@@ -21,17 +21,16 @@ Usage
 
 ```erlang
 %% Start a msg_batcher process
-BatcherParams = #{
+BatcherOpts = #{
     batch_size => 100,
     batch_time => 500,
-    callbacks => {erlang, display, []},
-    opts => #{drop_factor => 10}
+    drop_factor => 10
 },
-Handler = msg_batcher:start_supervised(_Name = abcd, BatcherParams).
+{ok, _Pid} = msg_batcher:start_supervised_simple(_Name = abcd, {erlang, display, []}, BatcherOpts).
 
 %% Put messages to the buffer. The bacher will call the _Callback when the buffer
 %% is full (_BatchSize reached) or timeout (after _BatchTime milliseconds).
-ok = msg_batcher:enqueue(Handler, _Msg = <<"hello">>).
+ok = msg_batcher:enqueue(_Name = abcd, _Msg = <<"hello">>).
 ```
 
 ### Use it as a `gen_server` like `behaviour`
@@ -56,12 +55,12 @@ ok = msg_batcher:enqueue(Handler, _Msg = <<"hello">>).
          code_change/3]).
 
 start_link(Args) ->
-    BatcherParams = #{
+    BatcherOpts = #{
         batch_size => 100,
         batch_time => 500,
-        opts => #{drop_factor => 10}
+        drop_factor => 10
     },
-    msg_batcher:start_link(_Name = ?MODULE, ?MODULE, Args, [], BatcherParams).
+    msg_batcher:start_link(_Name = ?MODULE, ?MODULE, Args, [], BatcherOpts).
 
 send_msg(Msg) ->
     msg_batcher:enqueue(_Name = ?MODULE, Msg).
