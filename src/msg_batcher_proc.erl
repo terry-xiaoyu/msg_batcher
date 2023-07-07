@@ -56,7 +56,7 @@ init({TabName, BhvMod, InitArgs, #{
             batch_time := BatchTime
        } = Opts}) ->
     _ = erlang:process_flag(trap_exit, true),
-    Tab = ets:new(TabName, [named_table, ordered_set, public, {write_concurrency, true}]),
+    Tab = ets:new(TabName, [ordered_set, public, {write_concurrency, true}]),
     CRef = counters:new(1, [write_concurrency]),
     TRef = send_flush_after(BatchTime),
     DropFactor = maps:get(drop_factor, Opts, ?DROP_FACTOR),
