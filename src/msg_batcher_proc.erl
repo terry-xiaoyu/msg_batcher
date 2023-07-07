@@ -35,7 +35,8 @@
     end).
 
 start_link(BhvMod, InitArgs, GenOpts, Opts) ->
-    gen_server:start_link(?MODULE, {?MODULE, BhvMod, InitArgs, Opts}, GenOpts).
+    TabName = maps:get(tab_name, Opts, ?MODULE),
+    gen_server:start_link(?MODULE, {TabName, BhvMod, InitArgs, Opts}, GenOpts).
 
 start_link(Name, BhvMod, InitArgs, GenOpts, Opts) ->
     gen_server:start_link({local, Name}, ?MODULE, {Name, BhvMod, InitArgs, Opts}, GenOpts).
@@ -50,12 +51,12 @@ enqueue(Name, Msg) ->
     incr_queue_size(CRef),
     maybe_notify_batcher_to_flush(Name, BatchSize, CRef, DropFactor, PunishTime).
 
-init({Name, BhvMod, InitArgs, #{
+init({TabName, BhvMod, InitArgs, #{
             batch_size := BatchSize,
             batch_time := BatchTime
        } = Opts}) ->
     _ = erlang:process_flag(trap_exit, true),
-    Tab = ets:new(Name, [named_table, ordered_set, public, {write_concurrency, true}]),
+    Tab = ets:new(TabName, [named_table, ordered_set, public, {write_concurrency, true}]),
     CRef = counters:new(1, [write_concurrency]),
     TRef = send_flush_after(BatchTime),
     DropFactor = maps:get(drop_factor, Opts, ?DROP_FACTOR),
