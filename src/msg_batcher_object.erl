@@ -5,13 +5,20 @@
         , delete/1
         ]).
 
+-define(KEY(NAME), {?MODULE, get_pid(NAME)}).
+
 %% =============================================================================
 %% Batcher objects
 %% =============================================================================
 
-put(Id, Handler) ->
-    persistent_term:put({?MODULE, Id}, Handler).
-get(Id) ->
-    persistent_term:get({?MODULE, Id}, not_found).
-delete(Id) ->
-    persistent_term:erase({?MODULE, Id}).
+put(Pid, Handler) when is_pid(Pid) ->
+    persistent_term:put(?KEY(Pid), Handler).
+get(Name) ->
+    persistent_term:get(?KEY(Name), not_found).
+delete(Name) ->
+    persistent_term:erase(?KEY(Name)).
+
+get_pid(Name) when is_atom(Name) ->
+    whereis(Name);
+get_pid(Pid) when is_pid(Pid) ->
+    Pid.

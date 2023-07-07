@@ -23,14 +23,18 @@ simple_batcher_test() ->
     },
     Callback = {erlang, send, [self()]},
     Name = abcd,
-    {ok, _Pid} = msg_batcher:start_supervised_simple(Name, Callback, BatcherOpts),
+    {ok, Pid} = msg_batcher:start_supervised_simple(Name, Callback, BatcherOpts),
     ?assertMatch(#{batch_size := 100, batch_time := 500,
                    drop_factor := 100, sender_punish_time := donot_punish},
         msg_batcher_object:get(Name)),
+    %% enqueue using Name
     lists:foreach(fun(_) ->
             ok = msg_batcher:enqueue(Name, _Msg = <<"hello">>)
-        end, lists:seq(1, 2000)),
-
+        end, lists:seq(1, 1000)),
+    %% enqueue using Pid
+    lists:foreach(fun(_) ->
+            ok = msg_batcher:enqueue(Pid, _Msg = <<"hello">>)
+        end, lists:seq(1, 1000)),
     RecvBatch = fun Recv(Acc) ->
         receive BatchMsgs ->
             Recv(BatchMsgs ++ Acc)
@@ -84,6 +88,47 @@ behaviour_batcher_test() ->
     receive {terminated, _} -> ok after 1000 -> throw(terminate_not_called) end,
     ?assertEqual(undefined, whereis(?MODULE)),
     ?assertEqual(not_found, msg_batcher_object:get(?MODULE)).
+
+behaviour_batcher_not_regsitered_test() ->
+    {ok, _} = application:ensure_all_started(msg_batcher),
+    BatcherOpts = #{
+        batch_size => 100,
+        batch_time => 500,
+        drop_factor => 100
+    },
+    %% call msg_batcher:start_link/4 to avoid registering the process
+    {ok, Pid} = msg_batcher:start_link(?MODULE, {self(), cont}, [], BatcherOpts),
+    receive {continued, cont} -> ok after 1000 -> throw(continue_not_called) end,
+
+    ?assertMatch(#{batch_size := 100, batch_time := 500,
+                   drop_factor := 100, sender_punish_time := donot_punish},
+        msg_batcher_object:get(Pid)),
+
+    %% test sending messges
+    lists:foreach(fun(_) ->
+            ok = msg_batcher:enqueue(Pid, _Msg = <<"hello">>)
+        end, lists:seq(1, 2000)),
+    timer:sleep(1000),
+    ?assertMatch(#{batch_callback_state := #{cnt := 2000},
+                   behaviour_module := ?MODULE},
+        sys:get_state(Pid)),
+
+    %% test gen_server msgs
+    ok = gen_server:call(Pid, <<"call">>),
+    ok = gen_server:cast(Pid, <<"cast">>),
+    Pid ! <<"info1">>,
+    Pid ! <<"info2">>,
+    ?assertMatch(#{batch_callback_state := #{
+            cnt := 2000,
+            got_call := [<<"call">>],
+            got_cast := [<<"cast">>],
+            got_info := [<<"info2">>, <<"info1">>]
+        }}, sys:get_state(Pid)),
+
+    ok = msg_batcher:stop(Pid),
+    receive {terminated, _} -> ok after 1000 -> throw(terminate_not_called) end,
+    ?assertEqual(false, is_process_alive(Pid)),
+    ?assertEqual(not_found, msg_batcher_object:get(Pid)).
 
 %%==============================================================================
 %% callbacks of msg_batcher

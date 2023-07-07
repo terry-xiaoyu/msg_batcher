@@ -63,6 +63,8 @@ start_link() ->
     msg_batcher:start_link(_Name = ?MODULE, ?MODULE, {}, [], BatcherOpts).
 
 send_msg(Msg) ->
+    %% You can also enqueue msgs using batcher's Pid:
+    %%      msg_batcher:enqueue(Pid, Msg).
     msg_batcher:enqueue(_Name = ?MODULE, Msg).
 
 init({}) ->

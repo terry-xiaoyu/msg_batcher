@@ -8,7 +8,7 @@
 -behaviour(gen_server).
 
 %% API
--export([start_link/5, stop/1]).
+-export([start_link/4, start_link/5, stop/1]).
 %% gen_server callbacks
 -export([init/1,
          handle_call/3,
@@ -34,33 +34,40 @@
         _ -> EXPR_FALSE
     end).
 
-start_link(Id, BhvMod, InitArgs, GenOpts, Opts) ->
-    gen_server:start_link({local, Id}, ?MODULE, {Id, BhvMod, InitArgs, Opts}, GenOpts).
+start_link(BhvMod, InitArgs, GenOpts, Opts) ->
+    gen_server:start_link(?MODULE, {?MODULE, BhvMod, InitArgs, Opts}, GenOpts).
 
-stop(Id) ->
-    gen_server:stop(Id).
+start_link(Name, BhvMod, InitArgs, GenOpts, Opts) ->
+    gen_server:start_link({local, Name}, ?MODULE, {Name, BhvMod, InitArgs, Opts}, GenOpts).
 
-enqueue(Id, Msg) ->
-    #{batcher_id := Id, batch_size := BatchSize, counter_ref := CRef,
-      drop_factor := DropFactor, sender_punish_time := PunishTime} = msg_batcher_object:get(Id),
-    ensure_msg_queued(Id, Msg),
+stop(Name) ->
+    gen_server:stop(Name).
+
+enqueue(Name, Msg) ->
+    #{batch_size := BatchSize, counter_ref := CRef, tab_ref := Tab,
+      drop_factor := DropFactor, sender_punish_time := PunishTime} = msg_batcher_object:get(Name),
+    ensure_msg_queued(Tab, Msg),
     incr_queue_size(CRef),
-    maybe_notify_batcher_to_flush(Id, BatchSize, CRef, DropFactor, PunishTime).
+    maybe_notify_batcher_to_flush(Name, BatchSize, CRef, DropFactor, PunishTime).
 
-init({Id, BhvMod, InitArgs, #{
+init({Name, BhvMod, InitArgs, #{
             batch_size := BatchSize,
             batch_time := BatchTime
        } = Opts}) ->
     _ = erlang:process_flag(trap_exit, true),
-    _ = ets:new(Id, [named_table, ordered_set, public, {write_concurrency, true}]),
+    Tab = ets:new(Name, [named_table, ordered_set, public, {write_concurrency, true}]),
     CRef = counters:new(1, [write_concurrency]),
     TRef = send_flush_after(BatchTime),
     DropFactor = maps:get(drop_factor, Opts, ?DROP_FACTOR),
     PunishTime = maps:get(sender_punish_time, Opts, donot_punish),
-    msg_batcher_object:put(Id, #{batcher_id => Id, batch_time => BatchTime,
-                                 batch_size => BatchSize, counter_ref => CRef,
-                                 drop_factor => DropFactor, sender_punish_time => PunishTime}),
-    Data = #{batcher_id => Id, behaviour_module => BhvMod,
+    msg_batcher_object:put(self(), #{
+        batch_time => BatchTime,
+        batch_size => BatchSize,
+        counter_ref => CRef,
+        tab_ref => Tab,
+        drop_factor => DropFactor,
+        sender_punish_time => PunishTime}),
+    Data = #{behaviour_module => BhvMod,
              counter_ref => CRef, timer_ref => TRef},
     case BhvMod of
         undefined ->
@@ -85,7 +92,7 @@ handle_cast(_Msg, #{behaviour_module := Mod, batch_callback_state := CallbackSta
     ?IF_EXPORTED(Mod, handle_cast, 2,
         handle_return(Mod:handle_cast(_Msg, CallbackState), Data), {noreply, Data}).
 
-handle_info(?FORCE_FLUSH, #{batcher_id := Id, batch_callback := Callback,
+handle_info(?FORCE_FLUSH, #{batch_callback := Callback,
                             batch_callback_state := CallbackState,
                             counter_ref := CRef, timer_ref := TRef} = Data) ->
     case erlang:cancel_timer(TRef) of
@@ -96,19 +103,19 @@ handle_info(?FORCE_FLUSH, #{batcher_id := Id, batch_callback := Callback,
         _ ->
             ok
     end,
-    #{batch_size := BatchSize, batch_time := BatchTime,
-      drop_factor := DropFactor} = msg_batcher_object:get(Id),
+    #{batch_size := BatchSize, batch_time := BatchTime, tab_ref := Tab,
+      drop_factor := DropFactor} = msg_batcher_object:get(self()),
     clean_mailbox(?FORCE_FLUSH, BatchSize * DropFactor),
-    {Cnt, NState} = do_flush(Id, BatchSize, Callback, CallbackState, CRef, DropFactor),
+    {Cnt, NState} = do_flush(Tab, BatchSize, Callback, CallbackState, CRef, DropFactor),
     {noreply, Data#{timer_ref => send_flush_after(BatchTime),
                     batch_callback_state => NState,
                     last_n_flush_cnt => record_last_flush_cnt(Data, Cnt)}};
-handle_info(?TIMER_FLUSH, #{batcher_id := Id, batch_callback := Callback,
+handle_info(?TIMER_FLUSH, #{batch_callback := Callback,
                             batch_callback_state := CallbackState,
                             counter_ref := CRef} = Data) ->
-    #{batch_size := BatchSize, batch_time := BatchTime,
-      drop_factor := DropFactor} = msg_batcher_object:get(Id),
-    {Cnt, NState} = do_flush(Id, BatchSize, Callback, CallbackState, CRef, DropFactor),
+    #{batch_size := BatchSize, batch_time := BatchTime, tab_ref := Tab,
+      drop_factor := DropFactor} = msg_batcher_object:get(self()),
+    {Cnt, NState} = do_flush(Tab, BatchSize, Callback, CallbackState, CRef, DropFactor),
     CheckTime = suitable_periodical_check_time(Data, BatchTime, Cnt),
     {noreply, Data#{timer_ref => send_flush_after(CheckTime),
                     batch_callback_state => NState,
@@ -122,8 +129,8 @@ handle_info(Info, #{behaviour_module := Mod, batch_callback_state := CallbackSta
     ?IF_EXPORTED(Mod, handle_info, 2,
         handle_return(Mod:handle_info(Info, CallbackState), Data), {noreply, Data}).
 
-terminate(Reason, #{batcher_id := Id, behaviour_module := Mod, batch_callback_state := CallbackState}) ->
-    msg_batcher_object:delete(Id),
+terminate(Reason, #{behaviour_module := Mod, batch_callback_state := CallbackState}) ->
+    msg_batcher_object:delete(self()),
     ?IF_EXPORTED(Mod, terminate, 2,
         Mod:terminate(Reason, CallbackState), ok).
 
@@ -183,12 +190,12 @@ handle_return({error, Reason}, _Data) ->
 %% Internal functions
 %% =============================================================================
 
-ensure_msg_queued(Id, Msg) ->
-    case ets:insert_new(Id, {msg_ts(), Msg}) of
+ensure_msg_queued(Tab, Msg) ->
+    case ets:insert_new(Tab, {msg_ts(), Msg}) of
         true -> ok;
         false ->
             %% the msg_ts() does not garantee an unique timestamp if called in parallel
-            ensure_msg_queued(Id, Msg)
+            ensure_msg_queued(Tab, Msg)
     end.
 
 clean_mailbox(Msg) ->
@@ -204,15 +211,15 @@ clean_mailbox(Msg, MaxCnt) ->
 send_flush_after(BatchTime) ->
     erlang:send_after(BatchTime, self(), ?TIMER_FLUSH).
 
-maybe_notify_batcher_to_flush(Id, BatchSize, CRef, DropFactor, PunishTime) ->
+maybe_notify_batcher_to_flush(Name, BatchSize, CRef, DropFactor, PunishTime) ->
     case get_queue_size(CRef) of
         Size when Size < BatchSize ->
             ok;
         Size when Size >= BatchSize, Size < BatchSize * DropFactor ->
-            Id ! ?FORCE_FLUSH,
+            Name ! ?FORCE_FLUSH,
             ok;
         Size ->
-            Id ! ?FORCE_FLUSH,
+            Name ! ?FORCE_FLUSH,
             maybe_punish_sender(PunishTime, Size)
     end.
 

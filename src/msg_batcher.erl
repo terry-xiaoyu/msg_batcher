@@ -1,6 +1,7 @@
 -module(msg_batcher).
 
--export([ start_link/5
+-export([ start_link/4
+        , start_link/5
         , stop/1
         , start_supervised_simple/3
         , start_supervised/5
@@ -76,6 +77,13 @@
 
 -optional_callbacks(
     [handle_info/2, handle_continue/2, terminate/2, code_change/3, format_status/2]).
+
+-spec start_link(Module :: module(),
+                 Args :: term(),
+                 Options :: [start_opt()],
+                 BatcherOpts :: batcher_opts()) -> {ok, pid()} | ignore | {error, term()}.
+start_link(Module, Args, Options, BatcherOpts) ->
+    msg_batcher_proc:start_link(Module, Args, Options, BatcherOpts).
 
 -spec start_link(ServerName :: server_name(),
                  Module :: module(),
