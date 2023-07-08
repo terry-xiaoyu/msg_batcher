@@ -64,11 +64,12 @@ behaviour_batcher_test() ->
         msg_batcher_object:get(?MODULE)),
 
     %% test sending messges
-    lists:foreach(fun(_) ->
-            ok = msg_batcher:enqueue(?MODULE, _Msg = <<"hello">>)
-        end, lists:seq(1, 2000)),
+    Msgs = lists:seq(1, 2000),
+    lists:foreach(fun(N) ->
+            ok = msg_batcher:enqueue(?MODULE, N)
+        end, Msgs),
     timer:sleep(1000),
-    ?assertMatch(#{batch_callback_state := #{cnt := 2000},
+    ?assertMatch(#{batch_callback_state := #{cnt := 2000, msgs := Msgs},
                    behaviour_module := ?MODULE},
         sys:get_state(Pid)),
 
@@ -133,7 +134,7 @@ behaviour_batcher_not_regsitered_test() ->
 %%==============================================================================
 %% callbacks of msg_batcher
 init({Parent, ContineInfo}) ->
-    {ok, #{cnt => 0, parent => Parent, got_call => [], got_cast => [], got_info => []},
+    {ok, #{cnt => 0, parent => Parent, got_call => [], got_cast => [], got_info => [], msgs => []},
         {continue, ContineInfo}}.
 handle_continue(Info, #{parent := Parent} = State) ->
     Parent ! {continued, Info},
@@ -144,8 +145,8 @@ handle_cast(Msg, #{got_cast := Casts} = State) ->
     {noreply, State#{got_cast => [Msg | Casts]}}.
 handle_info(Info, #{got_info := Infos} = State) ->
     {noreply, State#{got_info => [Info | Infos]}}.
-handle_batch(BatchMsgs, #{cnt := Cnt} = State) ->
-    {ok, State#{cnt => Cnt + length(BatchMsgs)}}.
+handle_batch(BatchMsgs, #{cnt := Cnt, msgs := Msgs} = State) ->
+    {ok, State#{cnt => Cnt + length(BatchMsgs), msgs => Msgs ++ BatchMsgs}}.
 terminate(Reason, #{parent := Parent}) ->
     Parent ! {terminated, Reason}.
 %%==============================================================================

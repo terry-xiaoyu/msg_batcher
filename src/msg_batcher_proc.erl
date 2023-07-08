@@ -261,7 +261,8 @@ take_first_n_msg(_Tab, _Key, N, MsgAcc) when N =< 0 ->
     lists:reverse(MsgAcc);
 take_first_n_msg(Tab, Key, N, MsgAcc) ->
     case ets:next(Tab, Key) of
-        '$end_of_table' -> MsgAcc;
+        '$end_of_table' ->
+            lists:reverse(MsgAcc);
         NextKey ->
             take_first_n_msg(Tab, NextKey, N - 1, [fetch_msg(Tab, NextKey) | MsgAcc])
     end.
