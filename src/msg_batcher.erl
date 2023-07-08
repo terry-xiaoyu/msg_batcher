@@ -26,6 +26,7 @@
         batch_size := pos_integer(),
         batch_time := pos_integer(),
         batcher_type => ets,
+        store_format => binary | term,
         batch_callback => {module(), atom(), [term()]},
         tab_name => atom(),
         %% defaults to ?DROP_FACTOR, set to a large number to "disable" dropping

@@ -45,9 +45,9 @@ stop(Name) ->
     gen_server:stop(Name).
 
 enqueue(Name, Msg) ->
-    #{batch_size := BatchSize, counter_ref := CRef, tab_ref := Tab,
+    #{batch_size := BatchSize, counter_ref := CRef, tab_ref := Tab, store_format := StoreFormat,
       drop_factor := DropFactor, sender_punish_time := PunishTime} = msg_batcher_object:get(Name),
-    ensure_msg_queued(Tab, Msg),
+    ensure_msg_queued(Tab, Msg, StoreFormat),
     incr_queue_size(CRef),
     maybe_notify_batcher_to_flush(Name, BatchSize, CRef, DropFactor, PunishTime).
 
@@ -61,13 +61,16 @@ init({TabName, BhvMod, InitArgs, #{
     TRef = send_flush_after(BatchTime),
     DropFactor = maps:get(drop_factor, Opts, ?DROP_FACTOR),
     PunishTime = maps:get(sender_punish_time, Opts, donot_punish),
+    StoreFormat = maps:get(store_format, Opts, term),
     msg_batcher_object:put(self(), #{
         batch_time => BatchTime,
         batch_size => BatchSize,
         counter_ref => CRef,
         tab_ref => Tab,
         drop_factor => DropFactor,
-        sender_punish_time => PunishTime}),
+        sender_punish_time => PunishTime,
+        store_format => StoreFormat
+    }),
     Data = #{behaviour_module => BhvMod,
              counter_ref => CRef, timer_ref => TRef},
     case BhvMod of
@@ -105,9 +108,9 @@ handle_info(?FORCE_FLUSH, #{batch_callback := Callback,
             ok
     end,
     #{batch_size := BatchSize, batch_time := BatchTime, tab_ref := Tab,
-      drop_factor := DropFactor} = msg_batcher_object:get(self()),
+      drop_factor := DropFactor, store_format := StoreFormat} = msg_batcher_object:get(self()),
     clean_mailbox(?FORCE_FLUSH, BatchSize * DropFactor),
-    {Cnt, NState} = do_flush(Tab, BatchSize, Callback, CallbackState, CRef, DropFactor),
+    {Cnt, NState} = do_flush(Tab, BatchSize, Callback, CallbackState, CRef, DropFactor, StoreFormat),
     {noreply, Data#{timer_ref => send_flush_after(BatchTime),
                     batch_callback_state => NState,
                     total_flush_cnt => record_total_flush_cnt(Data, Cnt),
@@ -116,8 +119,8 @@ handle_info(?TIMER_FLUSH, #{batch_callback := Callback,
                             batch_callback_state := CallbackState,
                             counter_ref := CRef} = Data) ->
     #{batch_size := BatchSize, batch_time := BatchTime, tab_ref := Tab,
-      drop_factor := DropFactor} = msg_batcher_object:get(self()),
-    {Cnt, NState} = do_flush(Tab, BatchSize, Callback, CallbackState, CRef, DropFactor),
+      drop_factor := DropFactor, store_format := StoreFormat} = msg_batcher_object:get(self()),
+    {Cnt, NState} = do_flush(Tab, BatchSize, Callback, CallbackState, CRef, DropFactor, StoreFormat),
     CheckTime = suitable_periodical_check_time(Data, BatchTime, Cnt),
     {noreply, Data#{timer_ref => send_flush_after(CheckTime),
                     batch_callback_state => NState,
@@ -193,13 +196,23 @@ handle_return({error, Reason}, _Data) ->
 %% Internal functions
 %% =============================================================================
 
-ensure_msg_queued(Tab, Msg) ->
-    case ets:insert_new(Tab, {msg_ts(), Msg}) of
+ensure_msg_queued(Tab, Msg, StoreFormat) ->
+    case ets:insert_new(Tab, buffer_record(Msg, StoreFormat)) of
         true -> ok;
         false ->
             %% the msg_ts() does not garantee an unique timestamp if called in parallel
-            ensure_msg_queued(Tab, Msg)
+            ensure_msg_queued(Tab, Msg, StoreFormat)
     end.
+
+buffer_record(Msg, term) ->
+    {msg_ts(), Msg};
+buffer_record(Msg, binary) ->
+    {msg_ts(), erlang:term_to_binary(Msg)}.
+
+maybe_decode_msg(Msg, term) ->
+    Msg;
+maybe_decode_msg(Msg, binary) ->
+    erlang:binary_to_term(Msg).
 
 clean_mailbox(Msg) ->
     clean_mailbox(Msg, 10_000_000_000).
@@ -233,15 +246,16 @@ maybe_punish_sender(PunishTime, Size) ->
     logger:warning("[ets-batcher] overloaded, current queue length: ~p, the sender process is punished to sleep ~p ms", [Size, PunishTime]),
     timer:sleep(PunishTime).
 
-do_flush(Tab, BatchSize, Callback, CallbackState, CRef, DropFactor) ->
-    do_flush(Tab, BatchSize, Callback, CallbackState, CRef, DropFactor, 0).
+do_flush(Tab, BatchSize, Callback, CallbackState, CRef, DropFactor, StoreFormat) ->
+    do_flush(Tab, BatchSize, Callback, CallbackState, CRef, DropFactor, StoreFormat, 0).
 
-do_flush(Tab, BatchSize, Callback, CallbackState, CRef, DropFactor, CntAcc) ->
+do_flush(Tab, BatchSize, Callback, CallbackState, CRef, DropFactor, StoreFormat, CntAcc) ->
     case ets:first(Tab) of
         '$end_of_table' ->
             {CntAcc, CallbackState};
         FirstKey ->
-            BatchMsgs = take_first_n_msg(Tab, FirstKey, BatchSize - 1, [fetch_msg(Tab, FirstKey)]),
+            BatchMsgs = take_first_n_msg(Tab, FirstKey, StoreFormat, BatchSize - 1,
+                            [fetch_msg(Tab, FirstKey, StoreFormat)]),
             Cnt = length(BatchMsgs),
             decr_queue_size(CRef, Cnt),
             case get_queue_size(CRef) of
@@ -250,30 +264,30 @@ do_flush(Tab, BatchSize, Callback, CallbackState, CRef, DropFactor, CntAcc) ->
                 Size when Size < BatchSize * DropFactor ->
                     NState = call_handle_batch(Callback, CallbackState, BatchMsgs),
                     %% we still have some msgs, flush again until the table is empty
-                    do_flush(Tab, BatchSize, Callback, NState, CRef, DropFactor, CntAcc + Cnt);
+                    do_flush(Tab, BatchSize, Callback, NState, CRef, DropFactor, StoreFormat, CntAcc + Cnt);
                 Size when Size >= BatchSize * DropFactor ->
                     %% the batcher got overloaded so the ETS table cannot be flushed in time.
                     %% we now simply drop msgs taken from the table
                     logger:warning("[ets-batcher] overloaded, current queue length: ~p, dropped ~p msgs", [Size, Cnt]),
-                    do_flush(Tab, BatchSize, Callback, CallbackState, CRef, DropFactor, CntAcc + Cnt)
+                    do_flush(Tab, BatchSize, Callback, CallbackState, CRef, DropFactor, StoreFormat, CntAcc + Cnt)
             end
     end.
 
-take_first_n_msg(_Tab, _Key, N, MsgAcc) when N =< 0 ->
+take_first_n_msg(_Tab, _Key, _, N, MsgAcc) when N =< 0 ->
     lists:reverse(MsgAcc);
-take_first_n_msg(Tab, Key, N, MsgAcc) ->
+take_first_n_msg(Tab, Key, StoreFormat, N, MsgAcc) ->
     case ets:next(Tab, Key) of
         '$end_of_table' ->
             lists:reverse(MsgAcc);
         NextKey ->
-            take_first_n_msg(Tab, NextKey, N - 1, [fetch_msg(Tab, NextKey) | MsgAcc])
+            take_first_n_msg(Tab, NextKey, StoreFormat, N - 1, [fetch_msg(Tab, NextKey, StoreFormat) | MsgAcc])
     end.
 
-fetch_msg(Tab, Key) ->
+fetch_msg(Tab, Key, StoreFormat) ->
     %% read value of Key from ets table, and then delete it
     case ets:take(Tab, Key) of
         [] -> throw({key_not_found, Key});
-        [{_, Msg}] -> Msg
+        [{_, Msg}] -> maybe_decode_msg(Msg, StoreFormat)
     end.
 
 call_handle_batch({M, F, A}, no_state, BatchMsgs) ->
