@@ -110,6 +110,7 @@ handle_info(?FORCE_FLUSH, #{batch_callback := Callback,
     {Cnt, NState} = do_flush(Tab, BatchSize, Callback, CallbackState, CRef, DropFactor),
     {noreply, Data#{timer_ref => send_flush_after(BatchTime),
                     batch_callback_state => NState,
+                    total_flush_cnt => record_total_flush_cnt(Data, Cnt),
                     last_n_flush_cnt => record_last_flush_cnt(Data, Cnt)}};
 handle_info(?TIMER_FLUSH, #{batch_callback := Callback,
                             batch_callback_state := CallbackState,
@@ -120,6 +121,7 @@ handle_info(?TIMER_FLUSH, #{batch_callback := Callback,
     CheckTime = suitable_periodical_check_time(Data, BatchTime, Cnt),
     {noreply, Data#{timer_ref => send_flush_after(CheckTime),
                     batch_callback_state => NState,
+                    total_flush_cnt => record_total_flush_cnt(Data, Cnt),
                     last_n_flush_cnt => record_last_flush_cnt(Data, Cnt)}};
 
 handle_info(Info, #{behaviour_module := undefined} = Data) ->
@@ -311,6 +313,11 @@ suitable_periodical_check_time(Data, BatchTime, _Cnt = 0) when BatchTime < ?FREQ
     end;
 suitable_periodical_check_time(_, BatchTime, _Cnt) ->
     BatchTime.
+
+record_total_flush_cnt(#{total_flush_cnt := TotalCnt}, Cnt) ->
+    TotalCnt + Cnt;
+record_total_flush_cnt(_, Cnt) ->
+    Cnt.
 
 record_last_flush_cnt(#{last_n_flush_cnt := #{1 := Last1Cnt}}, Cnt) ->
     #{1 => Cnt, 2 => Last1Cnt};
