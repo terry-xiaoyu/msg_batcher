@@ -96,9 +96,9 @@ handle_cast(_Msg, #{behaviour_module := Mod, batch_callback_state := CallbackSta
     ?IF_EXPORTED(Mod, handle_cast, 2,
         handle_return(Mod:handle_cast(_Msg, CallbackState), Data), {noreply, Data}).
 
-handle_info(?FORCE_FLUSH, #{batch_callback := Callback,
-                            batch_callback_state := CallbackState,
-                            counter_ref := CRef, timer_ref := TRef} = Data) ->
+handle_info(?FORCE_FLUSH, #{timer_ref := TRef} = Data0) ->
+    #{batch_size := BatchSize, batch_time := BatchTime, drop_factor := DropFactor}
+        = BatcherObj = msg_batcher_object:get(self()),
     case erlang:cancel_timer(TRef) of
         false ->
             %% try to clean the ?TIMER_FLUSH message as the timer was fired off
@@ -107,25 +107,14 @@ handle_info(?FORCE_FLUSH, #{batch_callback := Callback,
         _ ->
             ok
     end,
-    #{batch_size := BatchSize, batch_time := BatchTime, tab_ref := Tab,
-      drop_factor := DropFactor, store_format := StoreFormat} = msg_batcher_object:get(self()),
     clean_mailbox(?FORCE_FLUSH, BatchSize * DropFactor),
-    {Cnt, NState} = do_flush(Tab, BatchSize, Callback, CallbackState, CRef, DropFactor, StoreFormat),
-    {noreply, Data#{timer_ref => send_flush_after(BatchTime),
-                    batch_callback_state => NState,
-                    total_flush_cnt => record_total_flush_cnt(Data, Cnt),
-                    last_n_flush_cnt => record_last_flush_cnt(Data, Cnt)}};
-handle_info(?TIMER_FLUSH, #{batch_callback := Callback,
-                            batch_callback_state := CallbackState,
-                            counter_ref := CRef} = Data) ->
-    #{batch_size := BatchSize, batch_time := BatchTime, tab_ref := Tab,
-      drop_factor := DropFactor, store_format := StoreFormat} = msg_batcher_object:get(self()),
-    {Cnt, NState} = do_flush(Tab, BatchSize, Callback, CallbackState, CRef, DropFactor, StoreFormat),
-    CheckTime = suitable_periodical_check_time(Data, BatchTime, Cnt),
-    {noreply, Data#{timer_ref => send_flush_after(CheckTime),
-                    batch_callback_state => NState,
-                    total_flush_cnt => record_total_flush_cnt(Data, Cnt),
-                    last_n_flush_cnt => record_last_flush_cnt(Data, Cnt)}};
+    Data = flush(BatcherObj, Data0),
+    {noreply, Data#{timer_ref => send_flush_after(BatchTime)}};
+handle_info(?TIMER_FLUSH, Data0) ->
+    #{batch_time := BatchTime} = BatcherObj = msg_batcher_object:get(self()),
+    Data = flush(BatcherObj, Data0),
+    CheckTime = suitable_periodical_check_time(Data, BatchTime),
+    {noreply, Data#{timer_ref => send_flush_after(CheckTime)}};
 
 handle_info(Info, #{behaviour_module := undefined} = Data) ->
     logger:error("[ets-batcher] Unknown message: ~p", [Info]),
@@ -246,13 +235,26 @@ maybe_punish_sender(PunishTime, Size) ->
     logger:warning("[ets-batcher] overloaded, current queue length: ~p, the sender process is punished to sleep ~p ms", [Size, PunishTime]),
     timer:sleep(PunishTime).
 
-do_flush(Tab, BatchSize, Callback, CallbackState, CRef, DropFactor, StoreFormat) ->
-    do_flush(Tab, BatchSize, Callback, CallbackState, CRef, DropFactor, StoreFormat, 0).
+flush(#{batch_size := BatchSize, tab_ref := Tab, drop_factor := DropFactor,
+        store_format := StoreFormat},
+      #{batch_callback := Callback, batch_callback_state := CallbackState,
+        counter_ref := CRef} = Data) ->
+    {FlushCnt, DropCnt, NState} =
+        do_flush(Tab, BatchSize, Callback, CallbackState, CRef, DropFactor, StoreFormat),
+    Data#{
+        batch_callback_state => NState,
+        total_flush_cnt => incr_cnt(total_flush_cnt, Data, FlushCnt),
+        total_dropped_cnt => incr_cnt(total_dropped_cnt, Data, DropCnt),
+        last_n_flush_cnt => incr_last_flush_cnt(Data, FlushCnt)
+    }.
 
-do_flush(Tab, BatchSize, Callback, CallbackState, CRef, DropFactor, StoreFormat, CntAcc) ->
+do_flush(Tab, BatchSize, Callback, CallbackState, CRef, DropFactor, StoreFormat) ->
+    do_flush(Tab, BatchSize, Callback, CallbackState, CRef, DropFactor, StoreFormat, 0, 0).
+
+do_flush(Tab, BatchSize, Callback, CallbackState, CRef, DropFactor, StoreFormat, CntAcc, DropAcc) ->
     case ets:first(Tab) of
         '$end_of_table' ->
-            {CntAcc, CallbackState};
+            {CntAcc, DropAcc, CallbackState};
         FirstKey ->
             BatchMsgs = take_first_n_msg(Tab, FirstKey, StoreFormat, BatchSize - 1,
                             [fetch_msg(Tab, FirstKey, StoreFormat)]),
@@ -260,16 +262,18 @@ do_flush(Tab, BatchSize, Callback, CallbackState, CRef, DropFactor, StoreFormat,
             decr_queue_size(CRef, Cnt),
             case get_queue_size(CRef) of
                 0 ->
-                    {Cnt, call_handle_batch(Callback, CallbackState, BatchMsgs)};
+                    {CntAcc + Cnt, DropAcc, call_handle_batch(Callback, CallbackState, BatchMsgs)};
                 Size when Size < BatchSize * DropFactor ->
                     NState = call_handle_batch(Callback, CallbackState, BatchMsgs),
                     %% we still have some msgs, flush again until the table is empty
-                    do_flush(Tab, BatchSize, Callback, NState, CRef, DropFactor, StoreFormat, CntAcc + Cnt);
+                    do_flush(Tab, BatchSize, Callback, NState, CRef, DropFactor,
+                        StoreFormat, CntAcc + Cnt, DropAcc);
                 Size when Size >= BatchSize * DropFactor ->
                     %% the batcher got overloaded so the ETS table cannot be flushed in time.
                     %% we now simply drop msgs taken from the table
                     logger:warning("[ets-batcher] overloaded, current queue length: ~p, dropped ~p msgs", [Size, Cnt]),
-                    do_flush(Tab, BatchSize, Callback, CallbackState, CRef, DropFactor, StoreFormat, CntAcc + Cnt)
+                    do_flush(Tab, BatchSize, Callback, CallbackState, CRef, DropFactor,
+                        StoreFormat, CntAcc, DropAcc + Cnt)
             end
     end.
 
@@ -319,26 +323,24 @@ get_queue_size(CRef) ->
 decr_queue_size(CRef, Count) ->
     counters:sub(CRef, ?C_INDEX, Count).
 
-suitable_periodical_check_time(Data, BatchTime, _Cnt = 0) when BatchTime < ?FREQUENT_INTERVAL ->
+suitable_periodical_check_time(Data, BatchTime) when BatchTime < ?FREQUENT_INTERVAL ->
     %% avoid too frequent flush if the batcher is relatively free
-    case is_last_n_flush_empty(Data) of
+    case is_last_n_flush_zero(Data) of
         true -> ?FREQUENT_INTERVAL;
         false -> BatchTime
     end;
-suitable_periodical_check_time(_, BatchTime, _Cnt) ->
+suitable_periodical_check_time(_, BatchTime) ->
     BatchTime.
 
-record_total_flush_cnt(#{total_flush_cnt := TotalCnt}, Cnt) ->
-    TotalCnt + Cnt;
-record_total_flush_cnt(_, Cnt) ->
-    Cnt.
+incr_cnt(Key, Data, Cnt) ->
+    maps:get(Key, Data, 0) + Cnt.
 
-record_last_flush_cnt(#{last_n_flush_cnt := #{1 := Last1Cnt}}, Cnt) ->
+incr_last_flush_cnt(#{last_n_flush_cnt := #{1 := Last1Cnt}}, Cnt) ->
     #{1 => Cnt, 2 => Last1Cnt};
-record_last_flush_cnt(_, Cnt) ->
+incr_last_flush_cnt(_, Cnt) ->
     #{1 => Cnt}.
 
-is_last_n_flush_empty(#{last_n_flush_cnt := #{1 := 0, 2 := 0}}) ->
+is_last_n_flush_zero(#{last_n_flush_cnt := #{1 := 0, 2 := 0}}) ->
     true;
-is_last_n_flush_empty(_) ->
+is_last_n_flush_zero(_) ->
     false.
