@@ -109,6 +109,6 @@ start_supervised(Id, Module, InitArgs, Options, BatcherOpts) ->
 stop_supervised(Id) ->
     msg_batcher_sup:stop_supervised(Id).
 
--spec enqueue(server_name(), term()) -> ok.
+-spec enqueue(server_name(), term()) -> ok | {error, term()}.
 enqueue(ServerName, Msg) ->
     msg_batcher_proc:enqueue(ServerName, Msg).

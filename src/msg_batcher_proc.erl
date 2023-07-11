@@ -45,8 +45,16 @@ stop(Name) ->
     gen_server:stop(Name).
 
 enqueue(Name, Msg) ->
-    #{batch_size := BatchSize, counter_ref := CRef, tab_ref := Tab, store_format := StoreFormat,
-      drop_factor := DropFactor, sender_punish_time := PunishTime} = msg_batcher_object:get(Name),
+    case msg_batcher_object:get(Name) of
+        not_found ->
+            {error, batcher_not_found};
+        BatchObj ->
+            do_enqueue(Name, Msg, BatchObj)
+    end.
+
+do_enqueue(Name, Msg, #{batch_size := BatchSize, counter_ref := CRef,
+                        tab_ref := Tab, store_format := StoreFormat,
+                        drop_factor := DropFactor, sender_punish_time := PunishTime}) ->
     ensure_msg_queued(Tab, Msg, StoreFormat),
     incr_queue_size(CRef),
     maybe_notify_batcher_to_flush(Name, BatchSize, CRef, DropFactor, PunishTime).
@@ -125,6 +133,8 @@ handle_info(Info, #{behaviour_module := Mod, batch_callback_state := CallbackSta
         handle_return(Mod:handle_info(Info, CallbackState), Data), {noreply, Data}).
 
 terminate(Reason, #{behaviour_module := Mod, batch_callback_state := CallbackState}) ->
+    %% TODO: we need a monitor process to won the ETS table, and flush the msgs
+    %%   inserted after the batcher_proc is terminated.
     msg_batcher_object:delete(self()),
     ?IF_EXPORTED(Mod, terminate, 2,
         Mod:terminate(Reason, CallbackState), ok).
