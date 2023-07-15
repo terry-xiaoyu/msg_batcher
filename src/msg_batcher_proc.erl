@@ -55,9 +55,27 @@ enqueue(Name, Msg) ->
 do_enqueue(Name, Msg, #{batch_size := BatchSize, counter_ref := CRef,
                         tab_ref := Tab, store_format := StoreFormat,
                         drop_factor := DropFactor, sender_punish_time := PunishTime}) ->
-    ensure_msg_queued(Tab, Msg, StoreFormat),
-    incr_queue_size(CRef),
-    maybe_notify_batcher_to_flush(Name, BatchSize, CRef, DropFactor, PunishTime).
+    UpperLimit = max(BatchSize * DropFactor, BatchSize + 1),
+    case get_queue_size(CRef) + 1 of
+        Size when Size < BatchSize ->
+            ensure_msg_queued(Tab, Msg, StoreFormat, CRef);
+        Size when Size == BatchSize ->
+            ensure_msg_queued(Tab, Msg, StoreFormat, CRef),
+            Name ! ?FORCE_FLUSH,
+            ok;
+        Size when Size > BatchSize, Size =< UpperLimit ->
+            ensure_msg_queued(Tab, Msg, StoreFormat, CRef),
+            %% we have a "no notifiction window" to avoid notifying too frequently
+            case Size < max(BatchSize div 2, BatchSize + 1) of
+                true -> ok;
+                false -> Name ! ?FORCE_FLUSH, ok
+            end;
+        Size ->
+            logger:warning("[ets-batcher] overloaded, dropping msg. current queue length: ~p", [Size]),
+            Name ! ?FORCE_FLUSH,
+            maybe_punish_sender(PunishTime, Size),
+            {error, overloaded}
+    end.
 
 init({TabName, BhvMod, InitArgs, #{
             batch_size := BatchSize,
@@ -195,12 +213,12 @@ handle_return({error, Reason}, _Data) ->
 %% Internal functions
 %% =============================================================================
 
-ensure_msg_queued(Tab, Msg, StoreFormat) ->
+ensure_msg_queued(Tab, Msg, StoreFormat, CRef) ->
     case ets:insert_new(Tab, buffer_record(Msg, StoreFormat)) of
-        true -> ok;
+        true -> incr_queue_size(CRef);
         false ->
             %% the msg_ts() does not garantee an unique timestamp if called in parallel
-            ensure_msg_queued(Tab, Msg, StoreFormat)
+            ensure_msg_queued(Tab, Msg, StoreFormat, CRef)
     end.
 
 buffer_record(Msg, term) ->
@@ -225,18 +243,6 @@ clean_mailbox(Msg, MaxCnt) ->
 
 send_flush_after(BatchTime) ->
     erlang:send_after(BatchTime, self(), ?TIMER_FLUSH).
-
-maybe_notify_batcher_to_flush(Name, BatchSize, CRef, DropFactor, PunishTime) ->
-    case get_queue_size(CRef) of
-        Size when Size < BatchSize ->
-            ok;
-        Size when Size >= BatchSize, Size < BatchSize * DropFactor ->
-            Name ! ?FORCE_FLUSH,
-            ok;
-        Size ->
-            Name ! ?FORCE_FLUSH,
-            maybe_punish_sender(PunishTime, Size)
-    end.
 
 maybe_punish_sender(donot_punish, _) ->
     ok;
@@ -276,6 +282,7 @@ do_flush(Tab, BatchSize, Callback, CallbackState, CRef, DropFactor, StoreFormat,
                 Size when Size < BatchSize * DropFactor ->
                     NState = call_handle_batch(Callback, CallbackState, BatchMsgs),
                     %% we still have some msgs, flush again until the table is empty
+                    %% TODO: we need to give the process a chance to handle other msgs
                     do_flush(Tab, BatchSize, Callback, NState, CRef, DropFactor,
                         StoreFormat, CntAcc + Cnt, DropAcc);
                 Size when Size >= BatchSize * DropFactor ->
