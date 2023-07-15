@@ -22,11 +22,16 @@
 
 -export([enqueue/2]).
 
--define(C_INDEX, 1).
 -define(DROP_FACTOR, 10).
--define(FREQUENT_INTERVAL, 1000).
+-define(INFREQUENT_INTERVAL, 1000).
 -define(FORCE_FLUSH, '$force_flush').
 -define(TIMER_FLUSH, '$timer_flush').
+
+-define(CINDEX_QUEUE_LEN, 1).
+-define(CINDEX_TOTAL_DROPPED, 2).
+-define(CINDEX_TOTAL_FLUSH, 3).
+-define(CINDEX_LAST_FLUSH, 4).
+-define(CINDEX_MAX, 8).
 
 -define(IF_EXPORTED(MOD, FUN, ARITY, EXPR_TURE, EXPR_FALSE),
     case erlang:function_exported(Mod, FUN, ARITY) of
@@ -73,6 +78,7 @@ do_enqueue(Name, Msg, #{batch_size := BatchSize, counter_ref := CRef,
         Size ->
             logger:warning("[ets-batcher] overloaded, dropping msg. current queue length: ~p", [Size]),
             Name ! ?FORCE_FLUSH,
+            counters:add(CRef, ?CINDEX_TOTAL_DROPPED, 1),
             maybe_punish_sender(PunishTime, Size),
             {error, overloaded}
     end.
@@ -83,7 +89,7 @@ init({TabName, BhvMod, InitArgs, #{
        } = Opts}) ->
     _ = erlang:process_flag(trap_exit, true),
     Tab = ets:new(TabName, [ordered_set, public, {write_concurrency, true}]),
-    CRef = counters:new(1, [write_concurrency]),
+    CRef = counters:new(?CINDEX_MAX, [write_concurrency]),
     TRef = send_flush_after(BatchTime),
     DropFactor = maps:get(drop_factor, Opts, ?DROP_FACTOR),
     PunishTime = maps:get(sender_punish_time, Opts, donot_punish),
@@ -125,20 +131,16 @@ handle_cast(_Msg, #{behaviour_module := Mod, batch_callback_state := CallbackSta
 handle_info(?FORCE_FLUSH, #{timer_ref := TRef} = Data0) ->
     #{batch_size := BatchSize, batch_time := BatchTime, drop_factor := DropFactor}
         = BatcherObj = msg_batcher_object:get(self()),
-    case erlang:cancel_timer(TRef) of
-        false ->
-            %% try to clean the ?TIMER_FLUSH message as the timer was fired off
-            %% right before we cancel the timer
-            clean_mailbox(?TIMER_FLUSH);
-        _ ->
-            ok
-    end,
+    _ = erlang:cancel_timer(TRef),
     clean_mailbox(?FORCE_FLUSH, BatchSize * DropFactor),
     Data = flush(BatcherObj, Data0),
     {noreply, Data#{timer_ref => send_flush_after(BatchTime)}};
 handle_info(?TIMER_FLUSH, Data0) ->
-    #{batch_time := BatchTime} = BatcherObj = msg_batcher_object:get(self()),
-    Data = flush(BatcherObj, Data0),
+    #{batch_time := BatchTime, counter_ref := CRef} = BatcherObj = msg_batcher_object:get(self()),
+    Data = case get_queue_size(CRef) of
+        0 -> Data0;
+        _ -> flush(BatcherObj, Data0)
+    end,
     CheckTime = suitable_periodical_check_time(Data, BatchTime),
     {noreply, Data#{timer_ref => send_flush_after(CheckTime)}};
 
@@ -231,9 +233,6 @@ maybe_decode_msg(Msg, term) ->
 maybe_decode_msg(Msg, binary) ->
     erlang:binary_to_term(Msg).
 
-clean_mailbox(Msg) ->
-    clean_mailbox(Msg, 10_000_000_000).
-
 clean_mailbox(_Msg, 0) ->
     ok;
 clean_mailbox(Msg, MaxCnt) ->
@@ -257,6 +256,9 @@ flush(#{batch_size := BatchSize, tab_ref := Tab, drop_factor := DropFactor,
         counter_ref := CRef} = Data) ->
     {FlushCnt, DropCnt, NState} =
         do_flush(Tab, BatchSize, Callback, CallbackState, CRef, DropFactor, StoreFormat),
+    counters:put(CRef, ?CINDEX_LAST_FLUSH, FlushCnt),
+    counters:add(CRef, ?CINDEX_TOTAL_FLUSH, FlushCnt),
+    counters:add(CRef, ?CINDEX_TOTAL_DROPPED, DropCnt),
     Data#{
         batch_callback_state => NState,
         total_flush_cnt => incr_cnt(total_flush_cnt, Data, FlushCnt),
@@ -332,18 +334,18 @@ msg_ts() ->
     erlang:monotonic_time(nanosecond).
 
 incr_queue_size(CRef) ->
-    counters:add(CRef, ?C_INDEX, 1).
+    counters:add(CRef, ?CINDEX_QUEUE_LEN, 1).
 
 get_queue_size(CRef) ->
-    counters:get(CRef, ?C_INDEX).
+    counters:get(CRef, ?CINDEX_QUEUE_LEN).
 
 decr_queue_size(CRef, Count) ->
-    counters:sub(CRef, ?C_INDEX, Count).
+    counters:sub(CRef, ?CINDEX_QUEUE_LEN, Count).
 
-suitable_periodical_check_time(Data, BatchTime) when BatchTime < ?FREQUENT_INTERVAL ->
+suitable_periodical_check_time(Data, BatchTime) when BatchTime < ?INFREQUENT_INTERVAL ->
     %% avoid too frequent flush if the batcher is relatively free
     case is_last_n_flush_zero(Data) of
-        true -> ?FREQUENT_INTERVAL;
+        true -> ?INFREQUENT_INTERVAL;
         false -> BatchTime
     end;
 suitable_periodical_check_time(_, BatchTime) ->
