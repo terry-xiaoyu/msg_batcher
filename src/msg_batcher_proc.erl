@@ -24,6 +24,7 @@
 
 -define(DROP_FACTOR, 10).
 -define(INFREQUENT_INTERVAL, 1000).
+-define(MAX_FLUSH_LOOP, ?DROP_FACTOR).
 -define(FORCE_FLUSH, '$force_flush').
 -define(TIMER_FLUSH, '$timer_flush').
 
@@ -31,7 +32,7 @@
 -define(CINDEX_TOTAL_DROPPED, 2).
 -define(CINDEX_TOTAL_FLUSH, 3).
 -define(CINDEX_LAST_FLUSH, 4).
--define(CINDEX_MAX, 8).
+-define(CINDEX_MAX, 16).
 
 -define(IF_EXPORTED(MOD, FUN, ARITY, EXPR_TURE, EXPR_FALSE),
     case erlang:function_exported(Mod, FUN, ARITY) of
@@ -129,10 +130,9 @@ handle_cast(_Msg, #{behaviour_module := Mod, batch_callback_state := CallbackSta
         handle_return(Mod:handle_cast(_Msg, CallbackState), Data), {noreply, Data}).
 
 handle_info(?FORCE_FLUSH, #{timer_ref := TRef} = Data0) ->
-    #{batch_size := BatchSize, batch_time := BatchTime, drop_factor := DropFactor}
-        = BatcherObj = msg_batcher_object:get(self()),
+    #{batch_time := BatchTime} = BatcherObj = msg_batcher_object:get(self()),
     _ = erlang:cancel_timer(TRef),
-    clean_mailbox(?FORCE_FLUSH, BatchSize * DropFactor),
+    clean_mailbox(?FORCE_FLUSH, 10000),
     Data = flush(BatcherObj, Data0),
     {noreply, Data#{timer_ref => send_flush_after(BatchTime)}};
 handle_info(?TIMER_FLUSH, Data0) ->
@@ -267,9 +267,16 @@ flush(#{batch_size := BatchSize, tab_ref := Tab, drop_factor := DropFactor,
     }.
 
 do_flush(Tab, BatchSize, Callback, CallbackState, CRef, DropFactor, StoreFormat) ->
-    do_flush(Tab, BatchSize, Callback, CallbackState, CRef, DropFactor, StoreFormat, 0, 0).
+    do_flush(Tab, BatchSize, Callback, CallbackState, CRef, DropFactor,
+        StoreFormat, 0, 0, ?MAX_FLUSH_LOOP).
 
-do_flush(Tab, BatchSize, Callback, CallbackState, CRef, DropFactor, StoreFormat, CntAcc, DropAcc) ->
+do_flush(_Tab, _BatchSize, _Callback, CallbackState, _CRef, _DropFactor,
+        _StoreFormat, CntAcc, DropAcc, 0) ->
+    %% to avoid dead loop, here we give the process a chance to handle other msgs
+    self() ! ?FORCE_FLUSH,
+    {CntAcc, DropAcc, CallbackState};
+do_flush(Tab, BatchSize, Callback, CallbackState, CRef, DropFactor,
+        StoreFormat, CntAcc, DropAcc, Retry) ->
     case ets:first(Tab) of
         '$end_of_table' ->
             {CntAcc, DropAcc, CallbackState};
@@ -284,15 +291,14 @@ do_flush(Tab, BatchSize, Callback, CallbackState, CRef, DropFactor, StoreFormat,
                 Size when Size < BatchSize * DropFactor ->
                     NState = call_handle_batch(Callback, CallbackState, BatchMsgs),
                     %% we still have some msgs, flush again until the table is empty
-                    %% TODO: we need to give the process a chance to handle other msgs
                     do_flush(Tab, BatchSize, Callback, NState, CRef, DropFactor,
-                        StoreFormat, CntAcc + Cnt, DropAcc);
+                        StoreFormat, CntAcc + Cnt, DropAcc, Retry - 1);
                 Size when Size >= BatchSize * DropFactor ->
                     %% the batcher got overloaded so the ETS table cannot be flushed in time.
                     %% we now simply drop msgs taken from the table
                     logger:warning("[ets-batcher] overloaded, current queue length: ~p, dropped ~p msgs", [Size, Cnt]),
                     do_flush(Tab, BatchSize, Callback, CallbackState, CRef, DropFactor,
-                        StoreFormat, CntAcc, DropAcc + Cnt)
+                        StoreFormat, CntAcc, DropAcc + Cnt, Retry - 1)
             end
     end.
 
