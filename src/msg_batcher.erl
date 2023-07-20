@@ -24,7 +24,7 @@
 
 -type batcher_opts() :: #{
         batch_size := pos_integer(),
-        batch_time := pos_integer(),
+        batch_time := non_neg_integer(),
         batcher_type => ets,
         store_format => binary | term,
         batch_callback => {module(), atom(), [term()]},
